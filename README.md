@@ -173,6 +173,40 @@ jobs:
       - run: oxr float --tag ${{ github.ref_name }} --execute
 ```
 
+## CI/CD use cases
+
+Beyond floating-tag maintenance, `oxr` in a pipeline typically covers:
+
+- **Automated release cutting on merge/dispatch.** A CI job (triggered on
+  push to the default branch, or `workflow_dispatch` with a `level` input)
+  runs `oxr release <level> --execute` so nobody computes the next version
+  or runs `git tag` by hand. Works even with no manifest at all — the
+  primary use case for composite actions/reusable workflows.
+- **RC/pre-release validation pipelines.** CI on a release branch runs
+  `oxr release rc --execute` to cut `v1.5.0-rc.1`, `rc.2`, etc. for
+  staging/QA to consume. Once validated, `oxr release stable --execute`
+  finalizes it to `v1.5.0` — a real pre-release gate without hand-rolled
+  train-tracking logic.
+- **Two-stage release + float, gated on the test suite.** One workflow
+  tags `vX.Y.Z`; a second job triggered by `push: tags: v[semver]` runs the
+  full build/test suite and only on success runs `oxr float --tag
+  ${{ github.ref_name }} --execute` (see the example above). Consumers
+  pinned to `@v1` never get pointed at code that hasn't passed CI.
+- **Version-string sync via `pre-release-replacements`.** When a repo
+  still needs a literal version string somewhere (e.g. a plugin manifest),
+  `oxr release --execute` in CI rewrites that file and commits it as part
+  of the same run, instead of a maintainer doing it by hand each release.
+- **Read-only decisioning with `oxr current --json`.** A CI step branches
+  pipeline logic — e.g. skip changelog generation if no `active_train`, or
+  determine the diff range for release notes from `latest_stable` —
+  without hand-rolling tag parsing/sorting in bash (oxr uses real semver
+  precedence, not lexicographic order).
+- **Versioning composite actions/reusable workflows.** oxr's primary
+  target: repos that are just Actions YAML with no package manifest still
+  need GitHub's marketplace convention of floating major tags (`@v1`,
+  `@v2`), maintained automatically in CI instead of a maintainer manually
+  force-moving tags after every release.
+
 ## Configuration
 
 Read from `oxr.toml` at the repo root by default, falling back to
