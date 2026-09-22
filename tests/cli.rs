@@ -220,14 +220,14 @@ minor = true
     git(dir.path(), &["commit", "-q", "-m", "add config"]);
 
     // Bootstrap: first release always targets minor regardless of level.
-    let o = run(dir.path(), &["release", "patch", "--execute"]);
+    let o = run(dir.path(), &["release", "patch", "--execute", "--yes"]);
     assert!(o.status.success(), "{}", err(&o));
     assert!(out(&o).contains("none -> 0.1.0"));
     let plugin = std::fs::read_to_string(dir.path().join("plugin.json")).unwrap();
     assert!(plugin.contains("0.1.0"), "{plugin}");
 
     // A real bump, with the replacement, commit, tag, and push all firing.
-    let o = run(dir.path(), &["release", "minor", "--execute"]);
+    let o = run(dir.path(), &["release", "minor", "--execute", "--yes"]);
     assert!(o.status.success(), "{}", err(&o));
     assert!(out(&o).contains("0.1.0 -> 0.2.0"));
     let plugin = std::fs::read_to_string(dir.path().join("plugin.json")).unwrap();
@@ -244,7 +244,7 @@ minor = true
     assert!(remote_tags.contains("v0.2.0"), "{remote_tags}");
 
     // Start, advance, and finalize a pre-release train.
-    let o = run(dir.path(), &["release", "rc", "--execute"]);
+    let o = run(dir.path(), &["release", "rc", "--execute", "--yes"]);
     assert!(o.status.success(), "{}", err(&o));
     assert!(out(&o).contains("0.2.0 -> 0.2.1-rc.1"));
 
@@ -252,11 +252,11 @@ minor = true
     assert!(!o.status.success());
     assert!(err(&o).contains("pre-release maturity only moves forward"));
 
-    let o = run(dir.path(), &["release", "rc", "--execute"]);
+    let o = run(dir.path(), &["release", "rc", "--execute", "--yes"]);
     assert!(o.status.success(), "{}", err(&o));
     assert!(out(&o).contains("0.2.1-rc.2"));
 
-    let o = run(dir.path(), &["release", "stable", "--execute"]);
+    let o = run(dir.path(), &["release", "stable", "--execute", "--yes"]);
     assert!(o.status.success(), "{}", err(&o));
     assert!(out(&o).contains("0.2.1"));
 
@@ -276,7 +276,7 @@ minor = true
     )
     .unwrap();
 
-    let o = run(dir.path(), &["release", "major", "--execute"]);
+    let o = run(dir.path(), &["release", "major", "--execute", "--yes"]);
     assert!(o.status.success(), "{}", err(&o));
     assert!(out(&o).contains("0.2.1 -> 1.0.0"));
 
@@ -316,9 +316,32 @@ fn release_execute_refuses_a_dirty_working_tree_but_dry_run_still_previews() {
     let o = run(dir.path(), &["release", "patch"]);
     assert!(o.status.success(), "{}", err(&o));
 
-    let o = run(dir.path(), &["release", "patch", "--execute"]);
+    let o = run(dir.path(), &["release", "patch", "--execute", "--yes"]);
     assert!(!o.status.success());
     assert!(err(&o).contains("uncommitted changes"), "{}", err(&o));
+}
+
+#[test]
+fn release_execute_without_yes_aborts_on_unconfirmed_prompt() {
+    // `run` uses Output::output(), which closes stdin, so the confirmation
+    // prompt reads EOF and treats it as "no" without hanging the test.
+    let dir = init_repo();
+
+    let o = run(dir.path(), &["release", "patch", "--execute"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(out(&o).contains("[y/N]"), "{}", out(&o));
+    assert!(out(&o).contains("aborted"), "{}", out(&o));
+
+    let tags = String::from_utf8(
+        Command::new("git")
+            .args(["tag", "-l"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(tags.is_empty(), "{tags}");
 }
 
 #[test]
@@ -348,7 +371,7 @@ exactly = 1
     git(dir.path(), &["add", "oxr.toml", "plugin.json"]);
     git(dir.path(), &["commit", "-q", "-m", "add config"]);
 
-    let o = run(dir.path(), &["release", "patch", "--execute"]);
+    let o = run(dir.path(), &["release", "patch", "--execute", "--yes"]);
     assert!(o.status.success(), "{}", err(&o));
     let text = out(&o);
     assert!(text.contains("updated plugin.json"), "{text}");
@@ -377,7 +400,7 @@ fn release_refuses_a_tag_that_already_exists() {
     let o = run(dir.path(), &["current"]);
     assert!(out(&o).contains("latest_stable: none"), "{}", out(&o));
 
-    let o = run(dir.path(), &["release", "patch", "--execute"]);
+    let o = run(dir.path(), &["release", "patch", "--execute", "--yes"]);
     assert!(!o.status.success());
     assert!(err(&o).contains("already exists"), "{}", err(&o));
 }

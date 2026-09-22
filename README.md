@@ -66,13 +66,15 @@ cargo install --path .
 
 ```
 oxr init [--force]
-oxr release <level> [--for <major|minor>] [--execute]
+oxr release <level> [--for <major|minor>] [--execute] [--yes]
 oxr float --tag <tag> [--execute]
 oxr current [--json]
 ```
 
 Both `release` and `float` are dry-run by default: they print their plan
-and make no changes until `--execute` is passed.
+and make no changes until `--execute` is passed. `oxr release --execute`
+additionally asks for a `[y/N]` confirmation before mutating anything; pass
+`--yes` (or `-y`) to skip the prompt for non-interactive/CI use.
 
 ### `oxr init`
 
@@ -179,12 +181,13 @@ Beyond floating-tag maintenance, `oxr` in a pipeline typically covers:
 
 - **Automated release cutting on merge/dispatch.** A CI job (triggered on
   push to the default branch, or `workflow_dispatch` with a `level` input)
-  runs `oxr release <level> --execute` so nobody computes the next version
-  or runs `git tag` by hand. Works even with no manifest at all; that's the
-  primary use case for composite actions/reusable workflows.
+  runs `oxr release <level> --execute --yes` so nobody computes the next
+  version or runs `git tag` by hand (`--yes` skips the confirmation prompt,
+  since there's no one there to answer it). Works even with no manifest at
+  all; that's the primary use case for composite actions/reusable workflows.
 - **RC/pre-release validation pipelines.** CI on a release branch runs
-  `oxr release rc --execute` to cut `v1.5.0-rc.1`, `rc.2`, etc. for
-  staging/QA to consume. Once validated, `oxr release stable --execute`
+  `oxr release rc --execute --yes` to cut `v1.5.0-rc.1`, `rc.2`, etc. for
+  staging/QA to consume. Once validated, `oxr release stable --execute --yes`
   finalizes it to `v1.5.0`, giving a real pre-release gate without hand-rolled
   train-tracking logic.
 - **Two-stage release + float, gated on the test suite.** One workflow

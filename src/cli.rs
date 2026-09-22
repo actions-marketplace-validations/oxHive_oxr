@@ -31,6 +31,9 @@ pub enum Command {
         /// Actually mutate the repo. Without this, oxr only prints its plan.
         #[arg(long)]
         execute: bool,
+        /// Skip the confirmation prompt before releasing.
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
     },
     /// Move a floating major/minor tag to point at a stable release tag.
     Float {

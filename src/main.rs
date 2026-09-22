@@ -8,6 +8,7 @@ mod template;
 mod version;
 
 use std::env;
+use std::io::{self, Write};
 use std::path::Path;
 
 use anyhow::{bail, Context, Result};
@@ -58,7 +59,8 @@ fn run() -> Result<()> {
             level,
             for_target,
             execute,
-        } => run_release(&repo_root, &config, level, for_target, execute),
+            yes,
+        } => run_release(&repo_root, &config, level, for_target, execute, yes),
         cli::Command::Float { tag, execute } => run_float(&repo_root, &config, &tag, execute),
     }
 }
@@ -114,12 +116,21 @@ fn run_current(repo_root: &Path, config: &Config, json: bool) -> Result<()> {
     Ok(())
 }
 
+fn confirm(prompt: &str) -> Result<bool> {
+    print!("{prompt} [y/N] ");
+    io::stdout().flush()?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input)?;
+    Ok(matches!(input.trim().to_lowercase().as_str(), "y" | "yes"))
+}
+
 fn run_release(
     repo_root: &Path,
     config: &Config,
     level: Level,
     for_target: Option<ForTarget>,
     execute: bool,
+    yes: bool,
 ) -> Result<()> {
     let resolution = resolve(repo_root, config)?;
     let next = release::next_version(&resolution, level, for_target)?;
@@ -151,6 +162,11 @@ fn run_release(
         if config.push {
             println!("would push commit and tag to origin");
         }
+        return Ok(());
+    }
+
+    if !yes && !confirm(&format!("release {tag_name}?"))? {
+        println!("aborted");
         return Ok(());
     }
 
