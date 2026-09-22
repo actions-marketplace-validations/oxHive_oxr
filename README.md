@@ -15,15 +15,15 @@ sort.
 ### With curl
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/oxhive/oxr/main/install.sh | sh
+curl -fsSL https://get.oxhive.dev/oxr | sh
 ```
 
 Downloads the prebuilt binary for your platform (`Linux-X64`, `Linux-ARM64`,
 `macOS-ARM64`) from the latest GitHub release and installs it to
-`/usr/local/bin` (override with `OXR_INSTALL_DIR`). Pass a version to pin:
+`~/.local/bin` (override with `INSTALL_DIR`). Pass a version to pin:
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/oxhive/oxr/main/install.sh | sh -s v1.2.3
+curl -fsSL https://get.oxhive.dev/oxr | VERSION=v1.2.3 sh
 ```
 
 ### With Homebrew
