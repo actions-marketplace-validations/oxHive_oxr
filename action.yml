@@ -1,4 +1,4 @@
-name: 'oxr'
+name: 'oxrelease'
 description: 'Install the oxr semantic-version bump and git-tag orchestrator onto PATH'
 branding:
   icon: 'tag'
