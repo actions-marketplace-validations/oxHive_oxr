@@ -106,7 +106,9 @@ pub fn next_version(
     level: Level,
     for_target: Option<ForTarget>,
 ) -> Result<Version> {
-    let bootstrap = resolution.latest_stable.is_none() && resolution.latest_overall.is_none();
+    // No stable release yet: the first stable is always a minor bump from
+    // 0.0.0, even if pre-release tags already exist (e.g. `v0.1.0-rc.1`).
+    let bootstrap = resolution.latest_stable.is_none();
 
     match level {
         Level::Patch | Level::Minor | Level::Major => {
@@ -124,7 +126,19 @@ pub fn next_version(
                     _ => unreachable!(),
                 }
             };
-            Ok(bump(&base, target))
+            let next = bump(&base, target);
+            if bootstrap {
+                if let Some(train) = resolution.active_train() {
+                    if next < *train {
+                        bail!(
+                            "no stable release exists yet, and the active train ({train}) \
+                             targets a higher version than {next}; finalize it with \
+                             `oxr release stable` instead"
+                        );
+                    }
+                }
+            }
+            Ok(next)
         }
 
         Level::Stable => {
@@ -183,6 +197,7 @@ pub fn next_version(
                     }
 
                     let mut next = train.clone();
+                    next.build = BuildMetadata::EMPTY;
                     if stage == train_stage {
                         let counter = current_counter(train)? + 1;
                         next.pre = Prerelease::new(&format!("{}.{}", stage.name(), counter))?;
@@ -320,5 +335,31 @@ mod tests {
         let r = resolution(&["v1.4.2", "v1.5.0-rc.1"]);
         assert!(r.active_train().is_some());
         assert_eq!(next_version(&r, Level::Rc, None).unwrap(), v("1.5.0-rc.2"));
+    }
+
+    #[test]
+    fn prerelease_only_history_still_bootstraps_to_minor() {
+        // Regression: with only `v0.1.0-rc.1`, `patch` used to yield 0.0.1
+        // (below the train) and `major` 1.0.0.
+        let r = resolution(&["v0.1.0-rc.1"]);
+        assert_eq!(next_version(&r, Level::Patch, None).unwrap(), v("0.1.0"));
+        assert_eq!(next_version(&r, Level::Minor, None).unwrap(), v("0.1.0"));
+        assert_eq!(next_version(&r, Level::Major, None).unwrap(), v("0.1.0"));
+        assert_eq!(next_version(&r, Level::Rc, None).unwrap(), v("0.1.0-rc.2"));
+    }
+
+    #[test]
+    fn prerelease_only_history_refuses_to_undercut_a_higher_train() {
+        let r = resolution(&["v1.0.0-rc.1"]);
+        let err = next_version(&r, Level::Patch, None).unwrap_err();
+        assert!(err.to_string().contains("oxr release stable"), "{err}");
+        assert_eq!(next_version(&r, Level::Stable, None).unwrap(), v("1.0.0"));
+    }
+
+    #[test]
+    fn advancing_a_train_drops_build_metadata() {
+        let r = resolution(&["v1.4.2", "v1.5.0-rc.2+build.7"]);
+        // Version equality includes build metadata, so this fails if `+build.7` leaks.
+        assert_eq!(next_version(&r, Level::Rc, None).unwrap(), v("1.5.0-rc.3"));
     }
 }

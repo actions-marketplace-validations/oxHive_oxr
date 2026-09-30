@@ -4,34 +4,35 @@ branding:
   icon: 'tag'
   color: 'blue'
 
+inputs:
+  version:
+    description: >-
+      oxr release tag to install, e.g. v0.2.0. Defaults to the version in
+      the Cargo.toml at the ref this action is pinned to, so tag, floating
+      tag (@v1), and commit-SHA pins all resolve to a published release.
+    required: false
+    default: ''
+
 runs:
   using: "composite"
   steps:
     - name: Install oxr from GitHub release
       shell: bash
+      # Expressions go through env, never straight into the script.
+      env:
+        OXR_VERSION_INPUT: ${{ inputs.version }}
       run: |
         set -euo pipefail
 
-        case "${{ runner.os }}-${{ runner.arch }}" in
-          Linux-X64)   target=x86_64-unknown-linux-gnu ;;
-          Linux-ARM64) target=aarch64-unknown-linux-gnu ;;
-          macOS-ARM64) target=aarch64-apple-darwin ;;
-          *)
-            echo "::error::oxr has no prebuilt binary for ${{ runner.os }}-${{ runner.arch }}. Supported platforms: Linux-X64, Linux-ARM64, macOS-ARM64." >&2
-            exit 1
-            ;;
-        esac
+        version="$OXR_VERSION_INPUT"
+        if [ -z "$version" ]; then
+          version="v$(sed -n 's/^version = "\(.*\)"$/\1/p' "$GITHUB_ACTION_PATH/Cargo.toml" | head -n 1)"
+        fi
+        if [ "$version" = "v" ]; then
+          echo "::error::could not read a version from $GITHUB_ACTION_PATH/Cargo.toml; set the 'version' input" >&2
+          exit 1
+        fi
 
-        repo="${{ github.action_repository }}"
-        ref="${{ github.action_ref }}"
-        asset="oxr-${target}.tar.gz"
-        url="https://github.com/${repo}/releases/download/${ref}/${asset}"
-        dist_dir="${RUNNER_TEMP}/oxr-dist"
-
-        mkdir -p "$dist_dir"
-        echo "Downloading $url"
-        curl -fsSL "$url" -o "$dist_dir/$asset"
-        tar -xzf "$dist_dir/$asset" -C "$dist_dir"
-        chmod +x "$dist_dir/oxr"
-
-        echo "$dist_dir" >> "$GITHUB_PATH"
+        install_dir="${RUNNER_TEMP}/oxr-bin"
+        VERSION="$version" INSTALL_DIR="$install_dir" sh "$GITHUB_ACTION_PATH/install.sh"
+        echo "$install_dir" >> "$GITHUB_PATH"

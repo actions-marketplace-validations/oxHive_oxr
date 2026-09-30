@@ -2,6 +2,7 @@
 name = "oxr"
 version = "0.2.0"
 edition = "2021"
+rust-version = "1.85"
 description = "Semantic-version bump and git-tag orchestrator for manifest-less repos"
 license = "MIT"
 

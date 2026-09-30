@@ -1,6 +1,12 @@
-use anyhow::{bail, Result};
+use std::sync::LazyLock;
+
+use anyhow::{bail, Context, Result};
 use regex::Regex;
 use semver::Version;
+
+static VERSION_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?").unwrap()
+});
 
 /// The two resolution queries over tag state. Kept distinct per spec: they
 /// answer different questions and must never be conflated.
@@ -33,30 +39,38 @@ pub fn zero_version() -> Version {
 /// `v1.2.3-rc.1` -> `1.2.3-rc.1`. `tag-pattern` only filters which tags are
 /// considered; this is what actually strips a literal prefix like `v`.
 pub fn extract_version(tag: &str) -> Option<Version> {
-    let re = Regex::new(r"\d+\.\d+\.\d+(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?").unwrap();
-    let m = re.find(tag)?;
+    let m = VERSION_RE.find(tag)?;
     Version::parse(m.as_str()).ok()
+}
+
+/// Compiles the configured `tag-pattern`, naming the setting on failure.
+pub fn compile_pattern(tag_pattern: &str) -> Result<Regex> {
+    Regex::new(tag_pattern).with_context(|| format!("invalid tag-pattern '{tag_pattern}'"))
+}
+
+/// Every version carried by a tag matching `tag_pattern`. Errors on a
+/// matching tag that isn't valid semver rather than silently skipping it.
+pub fn matching_versions(tags: &[String], tag_pattern: &str) -> Result<Vec<Version>> {
+    let pattern = compile_pattern(tag_pattern)?;
+    tags.iter()
+        .filter(|tag| pattern.is_match(tag))
+        .map(|tag| match extract_version(tag) {
+            Some(v) => Ok(v),
+            None => bail!(
+                "tag '{tag}' matches tag-pattern '{tag_pattern}' but is not a valid semver version"
+            ),
+        })
+        .collect()
 }
 
 /// Resolves `latest_stable` and `latest_overall` from raw tag names, using a
 /// real semver-aware comparison (not lexicographic, not git's native tag
 /// sort) as required by the spec.
 pub fn resolve(tags: &[String], tag_pattern: &str) -> Result<Resolution> {
-    let pattern = Regex::new(tag_pattern)?;
     let mut latest_stable: Option<Version> = None;
     let mut latest_overall: Option<Version> = None;
 
-    for tag in tags {
-        if !pattern.is_match(tag) {
-            continue;
-        }
-        let version = match extract_version(tag) {
-            Some(v) => v,
-            None => bail!(
-                "tag '{tag}' matches tag-pattern '{tag_pattern}' but is not a valid semver version"
-            ),
-        };
-
+    for version in matching_versions(tags, tag_pattern)? {
         if version.pre.is_empty() && latest_stable.as_ref().is_none_or(|cur| version > *cur) {
             latest_stable = Some(version.clone());
         }
@@ -142,5 +156,11 @@ mod tests {
             extract_version("v1.2.3-rc.1"),
             Some(Version::parse("1.2.3-rc.1").unwrap())
         );
+    }
+
+    #[test]
+    fn invalid_tag_pattern_error_names_the_setting() {
+        let err = resolve(&tags(&["v1.0.0"]), "^v(").unwrap_err();
+        assert!(err.to_string().contains("invalid tag-pattern"), "{err}");
     }
 }
