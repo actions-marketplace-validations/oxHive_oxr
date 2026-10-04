@@ -23,6 +23,22 @@ fn run(cwd: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Like `run`, but lets git talk to the user directly (commit summary, push
+/// progress). Its stdout is sent to our stderr so oxr's stdout stays data-only.
+fn run_streaming(cwd: &Path, args: &[&str]) -> Result<()> {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdout(std::io::stderr())
+        .status()
+        .with_context(|| format!("failed to execute `git {}`", args.join(" ")))?;
+
+    if !status.success() {
+        bail!("`git {}` failed ({status})", args.join(" "));
+    }
+    Ok(())
+}
+
 pub fn repo_root(cwd: &Path) -> Result<PathBuf> {
     let out = run(cwd, &["rev-parse", "--show-toplevel"])?;
     Ok(PathBuf::from(out))
@@ -49,6 +65,10 @@ pub fn list_tags(repo_root: &Path) -> Result<Vec<String>> {
         .map(|s| s.to_string())
         .filter(|s| !s.is_empty())
         .collect())
+}
+
+pub fn current_branch(repo_root: &Path) -> Result<String> {
+    run(repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])
 }
 
 pub fn tag_exists(repo_root: &Path, name: &str) -> Result<bool> {
@@ -95,13 +115,11 @@ pub fn push_tag(repo_root: &Path, name: &str, force: bool) -> Result<()> {
         args.push("--force");
     }
     args.push(name);
-    run(repo_root, &args)?;
-    Ok(())
+    run_streaming(repo_root, &args)
 }
 
 pub fn push_current_branch(repo_root: &Path) -> Result<()> {
-    run(repo_root, &["push"])?;
-    Ok(())
+    run_streaming(repo_root, &["push"])
 }
 
 pub fn stage_and_commit(
@@ -120,8 +138,7 @@ pub fn stage_and_commit(
     }
     commit_args.push("-m");
     commit_args.push(message);
-    run(repo_root, &commit_args)?;
-    Ok(())
+    run_streaming(repo_root, &commit_args)
 }
 
 #[cfg(test)]

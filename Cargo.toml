@@ -10,6 +10,8 @@ name = "oxr"
 path = "src/main.rs"
 
 [dependencies]
+anstream = "1"
+anstyle = "1"
 clap = { version = "4", features = ["derive"] }
 semver = "1"
 serde = { version = "1", features = ["derive"] }
