@@ -33,6 +33,22 @@ fn run(cwd: &Path, args: &[&str]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Like `run`, but lets git talk to the user directly (commit summary, push
+/// progress). Its stdout is sent to our stderr so oxr's stdout stays data-only.
+fn run_streaming(cwd: &Path, args: &[&str]) -> Result<()> {
+    let status = Command::new("git")
+        .args(args)
+        .current_dir(cwd)
+        .stdout(std::io::stderr())
+        .status()
+        .with_context(|| format!("failed to execute `git {}`", args.join(" ")))?;
+
+    if !status.success() {
+        bail!("`git {}` failed ({status})", args.join(" "));
+    }
+    Ok(())
+}
+
 pub fn repo_root(cwd: &Path) -> Result<PathBuf> {
     let out = run(cwd, &["rev-parse", "--show-toplevel"])?;
     Ok(PathBuf::from(out))
@@ -151,8 +167,7 @@ pub fn push_refs(repo_root: &Path, refs: &[String], force: bool) -> Result<()> {
     }
     args.push("origin");
     args.extend(refs.iter().map(|s| s.as_str()));
-    run(repo_root, &args)?;
-    Ok(())
+    run_streaming(repo_root, &args)
 }
 
 pub fn stage_and_commit(
@@ -171,8 +186,7 @@ pub fn stage_and_commit(
     }
     commit_args.push("-m");
     commit_args.push(message);
-    run(repo_root, &commit_args)?;
-    Ok(())
+    run_streaming(repo_root, &commit_args)
 }
 
 #[cfg(test)]

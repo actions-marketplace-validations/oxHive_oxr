@@ -8,9 +8,11 @@ mod template;
 mod version;
 
 use std::env;
-use std::io::{self, IsTerminal, Write};
+use std::fmt::Display;
+use std::io::{self, IsTerminal};
 use std::path::Path;
 
+use anstyle::AnsiColor;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 use semver::Version;
@@ -21,10 +23,24 @@ use version::Resolution;
 
 fn main() -> Result<()> {
     if let Err(err) = run() {
-        eprintln!("error: {err:#}");
+        let s = AnsiColor::Red.on_default().bold();
+        anstream::eprintln!("{s}error{s:#}: {err:#}");
         std::process::exit(1);
     }
     Ok(())
+}
+
+/// cargo-style progress line on stderr: a right-aligned bold verb, then the
+/// message. anstream drops the color when stderr isn't a terminal or NO_COLOR
+/// is set, so CI logs and pipes get plain text.
+fn status(verb: &str, msg: impl Display) {
+    let s = AnsiColor::Green.on_default().bold();
+    anstream::eprintln!("{s}{verb:>12}{s:#} {msg}");
+}
+
+fn warn(msg: impl Display) {
+    let s = AnsiColor::Yellow.on_default().bold();
+    anstream::eprintln!("{s}warning{s:#}: {msg}");
 }
 
 fn run() -> Result<()> {
@@ -80,12 +96,12 @@ fn run_init(repo_root: &Path, force: bool) -> Result<()> {
     std::fs::write(&target, config::SCAFFOLD)
         .with_context(|| format!("writing {}", target.display()))?;
 
-    println!("wrote {}", target.display());
+    status("Created", target.display());
     if legacy.exists() {
-        println!(
-            "note: '{}' also exists; oxr.toml now takes precedence over it",
+        warn(format!(
+            "'{}' also exists; oxr.toml now takes precedence over it",
             legacy.display()
-        );
+        ));
     }
     Ok(())
 }
@@ -118,8 +134,7 @@ fn run_current(repo_root: &Path, config: &Config, json: bool) -> Result<()> {
 }
 
 fn confirm(prompt: &str) -> Result<bool> {
-    print!("{prompt} [y/N] ");
-    io::stdout().flush()?;
+    eprint!("{prompt} [y/N] ");
     let mut input = String::new();
     io::stdin().read_line(&mut input)?;
     Ok(matches!(input.trim().to_lowercase().as_str(), "y" | "yes"))
@@ -182,82 +197,69 @@ fn run_release(
 
     // Validates every replacement entry before anything is written.
     let changes = replace::plan(repo_root, &config.pre_release_replacements, &next)?;
-    let will_commit = changes.iter().any(|c| c.changed());
+    let commit = changes.iter().any(|c| c.changed());
+    let branch = git::current_branch(repo_root)?;
 
-    let from = resolution
-        .latest_stable
-        .as_ref()
-        .map(|v| v.to_string())
-        .unwrap_or_else(|| "none".to_string());
-    println!("{from} -> {next}  (tag: {tag_name})");
+    let name = repo_root
+        .file_name()
+        .map(|n| n.to_string_lossy())
+        .unwrap_or_default();
+    match &resolution.latest_stable {
+        Some(from) => status("Upgrading", format!("{name} from {from} to {next}")),
+        None => status("Upgrading", format!("{name} to {next}")),
+    }
 
-    if !execute {
-        println!("(dry run; pass --execute to apply)");
-        for c in &changes {
-            if c.changed() {
-                println!("would update {}", c.file);
-            } else {
-                println!("{} is already up to date", c.file);
-            }
-        }
-        if will_commit {
-            println!(
-                "would commit \"{}\"",
-                template::render(&config.pre_release_commit_message, &next)
+    if execute {
+        // Every precondition is checked before prompting, so answering "y"
+        // never leads straight into an avoidable error.
+        if git::is_dirty(repo_root)? {
+            bail!(
+                "'{}' has uncommitted changes; commit or stash them before releasing so the \
+                 release tag reflects a known state.",
+                repo_root.display()
             );
         }
-        if config.tag {
-            println!("would create tag {tag_name}");
+        if commit && config.push && branch.is_none() {
+            bail!(
+                "HEAD is detached, so the release commit would not be on any branch; check \
+                 out the branch to release from first"
+            );
         }
-        if config.push && (will_commit || config.tag) {
-            println!("would push to origin");
+        if config.push {
+            check_remote_tags_fetched(repo_root, config)?;
         }
-        return Ok(());
-    }
-
-    // Every precondition is checked before prompting, so answering "y"
-    // never leads straight into an avoidable error.
-    if git::is_dirty(repo_root)? {
-        bail!(
-            "'{}' has uncommitted changes; commit or stash them before releasing so the \
-             release tag reflects a known state.",
-            repo_root.display()
-        );
-    }
-    let branch = match git::current_branch(repo_root)? {
-        Some(b) => Some(b),
-        None if will_commit && config.push => bail!(
-            "HEAD is detached, so the release commit would not be on any branch; check out \
-             the branch to release from first"
-        ),
-        None => None,
-    };
-    if config.push {
-        check_remote_tags_fetched(repo_root, config)?;
-    }
-
-    if !yes {
-        if !io::stdin().is_terminal() {
-            bail!("refusing to release without confirmation: stdin is not a terminal; pass --yes to release non-interactively");
+        if !yes {
+            if !io::stdin().is_terminal() {
+                bail!(
+                    "refusing to release without confirmation: stdin is not a terminal; pass \
+                     --yes to release non-interactively"
+                );
+            }
+            if !confirm(&format!("release {tag_name}?"))? {
+                bail!("aborted; nothing was changed");
+            }
         }
-        if !confirm(&format!("release {tag_name}?"))? {
-            bail!("aborted; nothing was changed");
-        }
+    } else if commit && config.push && branch.is_none() {
+        warn("HEAD is detached; --execute will refuse to commit and push from here");
     }
 
     let orig_head = git::head_sha(repo_root)?;
     let mut tag_created = false;
-    let result = execute_release(
+    let result = release_steps(
         repo_root,
         config,
         &changes,
         &next,
         &tag_name,
         branch.as_deref(),
+        execute,
         &mut tag_created,
     );
 
     if let Err(err) = result {
+        if !execute {
+            return Err(err);
+        }
         let mut rollback = Vec::new();
         if tag_created {
             if let Err(e) = git::delete_tag(repo_root, &tag_name) {
@@ -279,56 +281,75 @@ fn run_release(
         )));
     }
 
-    println!("released {tag_name}");
+    if execute {
+        status("Released", &tag_name);
+    } else {
+        warn("aborting release due to dry run; re-run with --execute");
+    }
     Ok(())
 }
 
-fn execute_release(
+/// Dry run and execute walk the same steps and print the same lines; only
+/// execute mutates anything.
+#[allow(clippy::too_many_arguments)]
+fn release_steps(
     repo_root: &Path,
     config: &Config,
     changes: &[replace::FileChange],
     next: &Version,
     tag_name: &str,
     branch: Option<&str>,
+    execute: bool,
     tag_created: &mut bool,
 ) -> Result<()> {
-    replace::write(changes)?;
+    for c in changes {
+        if c.changed() {
+            status("Updating", &c.file);
+        } else {
+            status("Skipping", format!("{} (already up to date)", c.file));
+        }
+    }
+    if execute {
+        replace::write(changes)?;
+    }
+
     let changed: Vec<String> = changes
         .iter()
         .filter(|c| c.changed())
         .map(|c| c.file.clone())
         .collect();
-    for file in &changed {
-        println!("updated {file}");
-    }
-    for c in changes.iter().filter(|c| !c.changed()) {
-        println!("{} already up to date", c.file);
-    }
-
+    let commit = !changed.is_empty();
     let commit_message = template::render(&config.pre_release_commit_message, next);
-    if !changed.is_empty() {
-        git::stage_and_commit(repo_root, &changed, &commit_message, config.sign_commit)?;
-        println!("committed \"{commit_message}\"");
+    if commit {
+        status("Committing", &commit_message);
+        if execute {
+            git::stage_and_commit(repo_root, &changed, &commit_message, config.sign_commit)?;
+        }
     }
 
     if config.tag {
-        git::create_tag(repo_root, tag_name, &commit_message, config.sign_tag)?;
-        *tag_created = true;
-        println!("created tag {tag_name}");
+        status("Tagging", tag_name);
+        if execute {
+            git::create_tag(repo_root, tag_name, &commit_message, config.sign_tag)?;
+            *tag_created = true;
+        }
     }
 
-    if config.push {
+    if config.push && (commit || config.tag) {
+        let mut names = Vec::new();
         let mut refs = Vec::new();
-        if !changed.is_empty() {
-            let branch = branch.expect("detached HEAD rejected before committing");
+        if commit {
+            let branch = branch.unwrap_or("HEAD");
+            names.push(branch.to_string());
             refs.push(format!("refs/heads/{branch}"));
         }
         if config.tag {
+            names.push(tag_name.to_string());
             refs.push(format!("refs/tags/{tag_name}"));
         }
-        if !refs.is_empty() {
+        status("Pushing", format!("{} to origin", names.join(", ")));
+        if execute {
             git::push_refs(repo_root, &refs, false)?;
-            println!("pushed {} to origin", refs.join(", "));
         }
     }
     Ok(())
@@ -349,39 +370,45 @@ fn run_float(repo_root: &Path, config: &Config, tag: &str, execute: bool) -> Res
     let plan = float::plan(tag, &config.float_tags, &known)?;
 
     for (floating, newer) in &plan.skipped {
-        println!("{floating} stays put: {newer} is a newer stable release in its line");
+        status(
+            "Skipping",
+            format!("{floating} ({newer} is a newer stable release in its line)"),
+        );
     }
 
     if plan.tags.is_empty() {
         if plan.skipped.is_empty() {
-            println!(
-                "no floating tags enabled in [float-tags] (major and minor both false); nothing to do"
+            warn(
+                "no floating tags enabled in [float-tags] (major and minor both false); nothing to do",
             );
         } else {
-            println!("nothing to do");
+            warn("nothing to do");
         }
-        return Ok(());
-    }
-
-    for floating in &plan.tags {
-        println!("{floating} -> {tag} ({})", plan.version);
-    }
-
-    if !execute {
-        println!("(dry run; pass --execute to apply)");
         return Ok(());
     }
 
     let target_sha = git::commit_of(repo_root, tag)?;
     let message = format!("float {tag}");
     for floating in &plan.tags {
-        git::force_move_tag(repo_root, floating, &target_sha, &message, config.sign_tag)?;
-    }
-    if config.push {
-        let refs: Vec<String> = plan.tags.iter().map(|t| format!("refs/tags/{t}")).collect();
-        git::push_refs(repo_root, &refs, true)?;
+        status(
+            "Floating",
+            format!("{floating} to {tag} ({})", plan.version),
+        );
+        if execute {
+            git::force_move_tag(repo_root, floating, &target_sha, &message, config.sign_tag)?;
+        }
     }
 
-    println!("floated: {}", plan.tags.join(", "));
+    if config.push {
+        status("Pushing", format!("{} to origin", plan.tags.join(", ")));
+        if execute {
+            let refs: Vec<String> = plan.tags.iter().map(|t| format!("refs/tags/{t}")).collect();
+            git::push_refs(repo_root, &refs, true)?;
+        }
+    }
+
+    if !execute {
+        warn("aborting float due to dry run; re-run with --execute");
+    }
     Ok(())
 }

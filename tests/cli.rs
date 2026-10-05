@@ -87,7 +87,7 @@ fn init_writes_oxr_toml_and_respects_force() {
 
     let o = run(dir.path(), &["init"]);
     assert!(o.status.success(), "{}", err(&o));
-    assert!(out(&o).contains("wrote"));
+    assert!(err(&o).contains("Created"), "{}", err(&o));
     assert!(dir.path().join("oxr.toml").exists());
 
     let o = run(dir.path(), &["init"]);
@@ -105,8 +105,8 @@ fn init_notes_a_coexisting_release_toml() {
 
     let o = run(dir.path(), &["init"]);
     assert!(o.status.success(), "{}", err(&o));
-    assert!(out(&o).contains("release.toml"));
-    assert!(out(&o).contains("takes precedence"));
+    assert!(err(&o).contains("release.toml"));
+    assert!(err(&o).contains("takes precedence"));
 }
 
 #[test]
@@ -156,7 +156,7 @@ exactly = 1
 
     let o = run(dir.path(), &["release", "patch"]);
     assert!(o.status.success(), "{}", err(&o));
-    assert!(out(&o).contains("would update plugin.json"), "{}", out(&o));
+    assert!(err(&o).contains("Updating plugin.json"), "{}", err(&o));
 }
 
 #[test]
@@ -210,10 +210,11 @@ fn release_dry_run_prints_plan_and_mutates_nothing() {
 
     let o = run(dir.path(), &["release", "patch"]);
     assert!(o.status.success(), "{}", err(&o));
-    let text = out(&o);
-    assert!(text.contains("none -> 0.1.0"));
-    assert!(text.contains("(dry run; pass --execute to apply)"));
-    assert!(text.contains("would create tag v0.1.0"));
+    let text = err(&o);
+    assert!(text.contains(" to 0.1.0"), "{text}");
+    assert!(text.contains("Tagging v0.1.0"), "{text}");
+    assert!(text.contains("re-run with --execute"), "{text}");
+    assert!(out(&o).is_empty(), "status output belongs on stderr");
 
     assert!(run(dir.path(), &["current", "--json"])
         .stdout
@@ -264,14 +265,14 @@ minor = true
     // Bootstrap: first release always targets minor regardless of level.
     let o = run(dir.path(), &["release", "patch", "--execute", "--yes"]);
     assert!(o.status.success(), "{}", err(&o));
-    assert!(out(&o).contains("none -> 0.1.0"));
+    assert!(err(&o).contains(" to 0.1.0"), "{}", err(&o));
     let plugin = std::fs::read_to_string(dir.path().join("plugin.json")).unwrap();
     assert!(plugin.contains("0.1.0"), "{plugin}");
 
     // A real bump, with the replacement, commit, tag, and push all firing.
     let o = run(dir.path(), &["release", "minor", "--execute", "--yes"]);
     assert!(o.status.success(), "{}", err(&o));
-    assert!(out(&o).contains("0.1.0 -> 0.2.0"));
+    assert!(err(&o).contains("from 0.1.0 to 0.2.0"), "{}", err(&o));
     let plugin = std::fs::read_to_string(dir.path().join("plugin.json")).unwrap();
     assert!(plugin.contains("0.2.0"), "{plugin}");
     let remote_tags = String::from_utf8(
@@ -288,7 +289,7 @@ minor = true
     // Start, advance, and finalize a pre-release train.
     let o = run(dir.path(), &["release", "rc", "--execute", "--yes"]);
     assert!(o.status.success(), "{}", err(&o));
-    assert!(out(&o).contains("0.2.0 -> 0.2.1-rc.1"));
+    assert!(err(&o).contains("from 0.2.0 to 0.2.1-rc.1"), "{}", err(&o));
 
     let o = run(dir.path(), &["release", "beta"]);
     assert!(!o.status.success());
@@ -296,17 +297,17 @@ minor = true
 
     let o = run(dir.path(), &["release", "rc", "--execute", "--yes"]);
     assert!(o.status.success(), "{}", err(&o));
-    assert!(out(&o).contains("0.2.1-rc.2"));
+    assert!(err(&o).contains("0.2.1-rc.2"));
 
     let o = run(dir.path(), &["release", "stable", "--execute", "--yes"]);
     assert!(o.status.success(), "{}", err(&o));
-    assert!(out(&o).contains("0.2.1"));
+    assert!(err(&o).contains("Released v0.2.1"), "{}", err(&o));
 
     // Float major and minor, then confirm a major bump never touches v0.
     let o = run(dir.path(), &["float", "--tag", "v0.2.1", "--execute"]);
     assert!(o.status.success(), "{}", err(&o));
-    assert!(out(&o).contains("v0"));
-    assert!(out(&o).contains("v0.2"));
+    assert!(err(&o).contains("Floating v0 to v0.2.1"), "{}", err(&o));
+    assert!(err(&o).contains("Floating v0.2 to v0.2.1"), "{}", err(&o));
 
     let v0_before = String::from_utf8(
         Command::new("git")
@@ -320,7 +321,7 @@ minor = true
 
     let o = run(dir.path(), &["release", "major", "--execute", "--yes"]);
     assert!(o.status.success(), "{}", err(&o));
-    assert!(out(&o).contains("0.2.1 -> 1.0.0"));
+    assert!(err(&o).contains("from 0.2.1 to 1.0.0"), "{}", err(&o));
 
     let o = run(dir.path(), &["float", "--tag", "v1.0.0", "--execute"]);
     assert!(o.status.success(), "{}", err(&o));
@@ -424,18 +425,30 @@ exactly = 1
 
     let o = run(dir.path(), &["release", "patch", "--execute", "--yes"]);
     assert!(o.status.success(), "{}", err(&o));
-    let text = out(&o);
-    assert!(text.contains("updated plugin.json"), "{text}");
+    let text = err(&o);
+    let branch = String::from_utf8(
+        Command::new("git")
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .current_dir(dir.path())
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert!(text.contains("    Updating plugin.json"), "{text}");
     assert!(
-        text.contains(r#"committed "chore: release v0.1.0""#),
+        text.contains("  Committing chore: release v0.1.0"),
         "{text}"
     );
-    assert!(text.contains("created tag v0.1.0"), "{text}");
+    assert!(text.contains("     Tagging v0.1.0"), "{text}");
     assert!(
-        text.contains("pushed refs/heads/") && text.contains("refs/tags/v0.1.0 to origin"),
+        text.contains(&format!("     Pushing {}, v0.1.0 to origin", branch.trim())),
         "{text}"
     );
-    assert!(text.contains("released v0.1.0"), "{text}");
+    assert!(text.contains("    Released v0.1.0"), "{text}");
+    // Piped stderr is not a terminal, so no ANSI escapes leak into logs.
+    assert!(!text.contains('\x1b'), "{text}");
+    assert!(out(&o).is_empty(), "{}", out(&o));
 }
 
 #[test]
@@ -515,7 +528,8 @@ fn failed_push_rolls_back_so_a_retry_releases_the_same_version() {
     for _ in 0..2 {
         let o = run(dir.path(), &["release", "minor", "--execute", "--yes"]);
         assert!(!o.status.success());
-        assert!(out(&o).contains("0.1.0  (tag: v0.1.0)"), "{}", out(&o));
+        assert!(err(&o).contains(" to 0.1.0"), "{}", err(&o));
+        assert!(!err(&o).contains("0.2.0"), "{}", err(&o));
         assert!(err(&o).contains("rolled back"), "{}", err(&o));
 
         assert!(tags(dir.path()).is_empty());
@@ -568,14 +582,14 @@ exactly = 1
 
     let o = run(dir.path(), &["release", "patch"]);
     assert!(
-        out(&o).contains("README.md is already up to date"),
+        err(&o).contains("Skipping README.md (already up to date)"),
         "{}",
-        out(&o)
+        err(&o)
     );
 
     let o = run(dir.path(), &["release", "patch", "--execute", "--yes"]);
     assert!(o.status.success(), "{}", err(&o));
-    assert!(!out(&o).contains("committed"), "{}", out(&o));
+    assert!(!err(&o).contains("Committing"), "{}", err(&o));
     assert_eq!(git_out(dir.path(), &["rev-parse", "HEAD"]), head_before);
     assert!(tags(dir.path()).contains(&"v1.0.1".to_string()));
 }
@@ -656,7 +670,7 @@ fn float_with_no_floating_tags_enabled_is_a_no_op() {
 
     let o = run(dir.path(), &["float", "--tag", "v1.0.0", "--execute"]);
     assert!(o.status.success(), "{}", err(&o));
-    assert!(out(&o).contains("nothing to do"));
+    assert!(err(&o).contains("nothing to do"));
 }
 
 #[test]
@@ -666,7 +680,7 @@ fn float_dry_run_does_not_move_the_tag() {
 
     let o = run(dir.path(), &["float", "--tag", "v1.0.0"]);
     assert!(o.status.success(), "{}", err(&o));
-    assert!(out(&o).contains("(dry run; pass --execute to apply)"));
+    assert!(err(&o).contains("re-run with --execute"));
 
     let exists = Command::new("git")
         .args(["rev-parse", "--verify", "-q", "refs/tags/v1"])
@@ -700,7 +714,11 @@ fn float_skips_a_major_tag_that_a_newer_minor_already_owns() {
     git(dir.path(), &["tag", "v1.2.1"]);
     let o = run(dir.path(), &["float", "--tag", "v1.2.1", "--execute"]);
     assert!(o.status.success(), "{}", err(&o));
-    assert!(out(&o).contains("v1 stays put: 1.3.0"), "{}", out(&o));
+    assert!(
+        err(&o).contains("Skipping v1 (1.3.0 is a newer"),
+        "{}",
+        err(&o)
+    );
     assert_eq!(
         git_out(dir.path(), &["rev-parse", "v1^{commit}"]),
         v1_before
