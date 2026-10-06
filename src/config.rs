@@ -28,7 +28,7 @@ fn default_minor_tag_name() -> String {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "kebab-case", default)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct Config {
     pub sign_commit: bool,
     pub sign_tag: bool,
@@ -65,7 +65,7 @@ impl Default for Config {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "kebab-case", default)]
+#[serde(rename_all = "kebab-case", default, deny_unknown_fields)]
 pub struct FloatTags {
     #[serde(default = "default_true")]
     pub major: bool,
@@ -89,7 +89,7 @@ impl Default for FloatTags {
 }
 
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "kebab-case")]
+#[serde(rename_all = "kebab-case", deny_unknown_fields)]
 pub struct Replacement {
     pub file: String,
     pub search: String,
@@ -97,6 +97,10 @@ pub struct Replacement {
     pub exactly: usize,
 }
 
+/// Unknown keys are rejected rather than ignored: a typo (`sign-tags`) or a
+/// cargo-release-only field (`tag-prefix`) must not silently fall back to
+/// a default.
+///
 /// Loads `oxr.toml` from the repo root, falling back to `release.toml` for
 /// anyone coming from cargo-release out of habit. `oxr.toml` is checked
 /// first (and is what `oxr init` writes) so the unambiguous name wins by
@@ -249,5 +253,19 @@ exactly = 1
         std::fs::write(dir.path().join("oxr.toml"), SCAFFOLD).unwrap();
         let c = load(dir.path()).unwrap();
         assert_eq!(c.tag_name, "v{{version}}");
+    }
+
+    #[test]
+    fn unknown_keys_are_rejected() {
+        // Regression: typos and cargo-release-only keys were silently ignored.
+        for text in [
+            "pushh = false\n",
+            "tag-prefix = \"v\"\n",
+            "[float-tags]\nmajr = false\n",
+            "[[pre-release-replacements]]\nfile = \"f\"\nsearch = \"x\"\nreplace = \"y\"\nexactly = 1\nmin = 1\n",
+        ] {
+            let err = toml::from_str::<Config>(text).unwrap_err();
+            assert!(err.to_string().contains("unknown field"), "{text}: {err}");
+        }
     }
 }

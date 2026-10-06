@@ -24,8 +24,8 @@ pub enum Command {
     /// Bump the version and create a release tag (dry run unless --execute).
     Release {
         level: Level,
-        /// Which component to bump when starting a fresh pre-release train,
-        /// or the resolved patch/minor/major level itself.
+        /// Which component a fresh alpha/beta/rc train bumps (default: patch).
+        /// Only valid with alpha, beta, or rc.
         #[arg(long = "for")]
         for_target: Option<ForTarget>,
         /// Actually mutate the repo. Without this, oxr only prints its plan.

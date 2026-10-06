@@ -1,5 +1,8 @@
 name: Publish
 
+# alpha/beta tags are intentionally not published: the shared pipeline only
+# recognizes `-rc` as a pre-release and would push anything else to
+# Homebrew/crates as if it were stable.
 on:
   push:
     tags:
@@ -14,7 +17,9 @@ jobs:
       pull-requests: read
       checks: write
       packages: write
-    uses: oxHive/pipelines/.github/workflows/rust-release.yml@v2
+    # Pinned to a commit: this job inherits every repo secret, so a moved
+    # tag must not be able to change the code it runs. Dependabot bumps it.
+    uses: oxHive/pipelines/.github/workflows/rust-release.yml@50dc32fcdc6298928492b893b482b40135c1d367 # v2.10.1
     with:
       package-name: oxr
       binary-name: oxr

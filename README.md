@@ -26,6 +26,10 @@ Downloads the prebuilt binary for your platform (`Linux-X64`, `Linux-ARM64`,
 curl -fsSL https://get.oxhive.dev/oxr | VERSION=v1.2.3 sh
 ```
 
+The tarball is verified against the release's `checksums.txt` before it's
+installed. Releases before `v0.2.0` published no checksums; installing one
+of those requires `OXR_SKIP_CHECKSUM=1`.
+
 ### With Homebrew
 
 ```sh
@@ -45,16 +49,24 @@ steps:
 
   - uses: oxhive/oxr@v1
 
-  - run: oxr release patch --execute
+  # Release commits and annotated tags need a git identity.
+  - run: |
+      git config user.name "github-actions[bot]"
+      git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+  - run: oxr release patch --execute --yes
 ```
 
 `oxr` refuses to run against a shallow checkout with a clear error rather
 than silently miscalculating the version, so a missing `fetch-depth: 0` is
 caught immediately.
 
-`action.yml` downloads the matching prebuilt binary from the GitHub release
-tagged with the ref it's pinned to (`@v1`, `@v1.2.3`, ...). Supported
-platforms: `Linux-X64`, `Linux-ARM64`, `macOS-ARM64`.
+`action.yml` installs the prebuilt binary (checksum-verified) from the GitHub
+release matching the `version` in `Cargo.toml` at the ref the action is
+pinned to. That makes release tags, floating tags (`@v1`), and commit SHAs
+all resolve to a real release. Override it with the `version` input
+(`with: { version: v1.2.3 }`). Supported platforms: `Linux-X64`,
+`Linux-ARM64`, `macOS-ARM64`.
 
 ### Locally
 
@@ -74,7 +86,10 @@ oxr current [--json]
 Both `release` and `float` are dry-run by default: they print their plan
 and make no changes until `--execute` is passed. `oxr release --execute`
 additionally asks for a `[y/N]` confirmation before mutating anything; pass
-`--yes` (or `-y`) to skip the prompt for non-interactive/CI use.
+`--yes` (or `-y`) to skip the prompt for non-interactive/CI use. Without
+`--yes`, a run with no terminal on stdin (e.g. CI) fails instead of
+prompting, and declining the prompt exits non-zero, so a pipeline can never
+report success for a release that didn't happen.
 
 ### `oxr init`
 
@@ -101,8 +116,8 @@ state:
 - `latest_stable`: the highest semver tag with no pre-release component.
 - `active_train`: the latest pre-release tag overall, if one exists.
 
-Run this before `release`/`execute` when it isn't obvious what either
-command will actually do.
+Run this before `release --execute` or `float --execute` when it isn't
+obvious what either command will actually do.
 
 ### `oxr release <level>`
 
@@ -114,9 +129,21 @@ command will actually do.
 
 **Commit vs. tag-only.** `oxr release --execute` only creates a
 `pre-release-commit-message` commit (e.g. `chore: release v1.2.3`) when at
-least one `pre-release-replacements` entry actually rewrote a file. With no entries configured, there's nothing to
-commit, so it creates and pushes the tag directly against the current
-`HEAD`, and no commit is created.
+least one `pre-release-replacements` entry actually changed a file's
+contents. With no entries configured, or when every entry renders text
+that's already there, there's nothing to commit, so it tags the current
+`HEAD` directly.
+
+**Safety checks and rollback.** Before prompting, `--execute` checks that
+the working tree is clean, every replacement entry matches, HEAD isn't
+detached (when a commit will be pushed), and, when `push = true`, that
+`origin` has no release tags this clone hasn't fetched (run
+`git fetch --tags` if it does). The release commit and tag are then pushed
+to `origin` in one atomic push (`refs/heads/<current branch>` plus
+`refs/tags/<tag>`), so no upstream needs to be configured. If any step
+fails, the local commit, tag, and file changes are rolled back, so a retry
+computes the same version instead of bumping past a release that never
+reached the remote.
 
 **Pre-release trains.** A train is active whenever the highest-precedence
 tag overall carries a pre-release component; this is derived purely from
@@ -129,11 +156,15 @@ top of an existing `beta` or `rc` (or `beta` on top of `rc`) is an error.
 `--for` on an already-active train must match the train's existing target
 or oxr errors rather than silently ignoring it.
 
-**Bootstrap.** With zero matching tags, the implicit baseline is `0.0.0`
+**Bootstrap.** With no stable tag yet, the implicit baseline is `0.0.0`
 and oxr always targets a minor bump regardless of the requested level:
-the first release is `0.1.0`, not `0.0.1` or `1.0.0`, unless `--for`
-explicitly overrides it. To start at `1.0.0` directly with no override,
-tag it manually first: `git tag v1.0.0`.
+the first stable release is `0.1.0`, not `0.0.1` or `1.0.0`, unless `--for`
+explicitly overrides it (for a pre-release train). This holds even if
+pre-release tags already exist: with only `v0.1.0-rc.2`, `release patch`
+gives `0.1.0`. If the active train targets something higher (e.g.
+`v1.0.0-rc.1`), `patch`/`minor`/`major` error and point at
+`oxr release stable`. To start at `1.0.0` directly with no override, tag
+it manually first: `git tag v1.0.0`.
 
 **Known edge case.** Because semver precedence compares
 `major.minor.patch` before pre-release status, a shelved pre-release tag
@@ -149,8 +180,13 @@ point at `tag`. Hard-refuses if `tag` carries a pre-release identifier:
 floating tags exist so consumers pinning to `@v1` get trusted, stable code,
 and this check lives in the binary itself, not just in CI trigger wiring.
 
-A major bump only ever creates the new major's floating tag; the previous
-major's floating tag is never touched.
+A floating tag only moves if `tag` is the newest stable release in its line:
+floating a hotfix for an older minor (`v1.2.1` after `v1.3.0`) moves `v1.2`
+but leaves `v1` on `v1.3.0` instead of dragging it backwards. `tag` must
+match `tag-pattern`. A major bump only ever creates the new major's floating
+tag; the previous major's floating tag is never touched. Floating tags are
+pushed as `refs/tags/<name>` in one atomic push, so a same-named branch
+(e.g. a `v1` release branch) doesn't get in the way.
 
 Recommended: run `float` from its own CI job, gated on the release tag's
 test/build suite passing, with its own scoped credentials, never from
@@ -172,7 +208,12 @@ jobs:
         with: { fetch-depth: 0 }
       - uses: oxhive/oxr@v1
       # ...run the repo's test/build suite here; only float on success...
-      - run: oxr float --tag ${{ github.ref_name }} --execute
+      - run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          oxr float --tag "$TAG" --execute
+        env:
+          TAG: ${{ github.ref_name }}
 ```
 
 ## CI/CD use cases
@@ -268,19 +309,25 @@ exactly = 1
 - `tag-pattern` filters which existing tags oxr considers during version
   resolution; any tag not matching it is ignored entirely. It's decoupled
   from `tag-name`, which governs the format of *new* tags.
+- Unknown keys are an error, not silently ignored, so a typo
+  (`sign-tags`) or a cargo-release-only key (`tag-prefix`) is caught.
+- `tag-name` must render tags that `tag-pattern` matches and that parse
+  back to the same version; otherwise new tags would be invisible to the
+  next release, and oxr refuses to create them.
 - `pre-release-replacements` entries fail loudly if `search` doesn't match
   the file exactly `exactly` times, so a drifted regex can't silently
-  no-op. `replace` is rendered for `{{version}}`/`{{major}}`/`{{minor}}`/
+  no-op. Every entry is checked before any file is written. `file` must be
+  a relative path inside the repository. `replace` is rendered for `{{version}}`/`{{major}}`/`{{minor}}`/
   `{{patch}}` first, then applied as a regex replacement, so it also
-  supports backreferences (`$1`, `$2`, ...) to preserve parts of the
-  original match.
+  supports backreferences (`$1`, `$2`, `${name}`, ...) to preserve parts of
+  the original match. A reference directly followed by a placeholder is
+  safe: `$1{{version}}` means group 1 then the version, not group `11`.
 - Template variables: `{{version}}` (includes any pre-release suffix, e.g.
   `1.5.0-rc.1`), `{{major}}`, `{{minor}}`, `{{patch}}`.
 
 ## Out of scope
 
-See the handover spec for the full reasoning. In short, oxr deliberately
-does not have: a `publish` command, a `tag-prefix` field (the `v` lives in
-`tag-name`), a post-release "dev version" bump, self-reference version
+oxr deliberately does not have: a `publish` command, a `tag-prefix` field
+(the `v` lives in `tag-name`), a post-release "dev version" bump, self-reference version
 bumping (GitHub's `$/` syntax already solves that), workspace/multi-crate
 release ordering, or a floating "staging" pointer like `@next`.

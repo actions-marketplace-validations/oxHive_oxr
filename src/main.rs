@@ -9,12 +9,13 @@ mod version;
 
 use std::env;
 use std::fmt::Display;
-use std::io;
+use std::io::{self, IsTerminal};
 use std::path::Path;
 
 use anstyle::AnsiColor;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
+use semver::Version;
 
 use config::Config;
 use release::{ForTarget, Level};
@@ -139,6 +140,42 @@ fn confirm(prompt: &str) -> Result<bool> {
     Ok(matches!(input.trim().to_lowercase().as_str(), "y" | "yes"))
 }
 
+/// Errors unless `tag_name` would be picked up again by version resolution:
+/// it must match `tag-pattern` and carry exactly `next`. Otherwise every
+/// new tag is invisible and each release recomputes the same version.
+fn check_tag_name_round_trips(config: &Config, tag_name: &str, next: &Version) -> Result<()> {
+    let pattern = version::compile_pattern(&config.tag_pattern)?;
+    if !pattern.is_match(tag_name) || version::extract_version(tag_name).as_ref() != Some(next) {
+        bail!(
+            "tag-name renders '{tag_name}', which tag-pattern '{}' would not resolve back to \
+             {next}; the new tag would be invisible to the next release. Make tag-name and \
+             tag-pattern agree.",
+            config.tag_pattern
+        );
+    }
+    Ok(())
+}
+
+/// Errors if origin has release tags this clone hasn't fetched: the next
+/// version would be computed from stale local state.
+fn check_remote_tags_fetched(repo_root: &Path, config: &Config) -> Result<()> {
+    let pattern = version::compile_pattern(&config.tag_pattern)?;
+    let local = git::list_tags(repo_root)?;
+    let missing: Vec<String> = git::remote_tags(repo_root, "origin")
+        .context("checking origin's tags before releasing")?
+        .into_iter()
+        .filter(|t| pattern.is_match(t) && !local.contains(t))
+        .collect();
+    if !missing.is_empty() {
+        bail!(
+            "origin has release tags this clone hasn't fetched ({}); run `git fetch --tags` \
+             so the next version isn't computed from stale tags",
+            missing.join(", ")
+        );
+    }
+    Ok(())
+}
+
 fn run_release(
     repo_root: &Path,
     config: &Config,
@@ -151,9 +188,17 @@ fn run_release(
     let next = release::next_version(&resolution, level, for_target)?;
     let tag_name = template::render(&config.tag_name, &next);
 
+    if config.tag {
+        check_tag_name_round_trips(config, &tag_name, &next)?;
+    }
     if git::tag_exists(repo_root, &tag_name)? {
         bail!("tag '{tag_name}' already exists");
     }
+
+    // Validates every replacement entry before anything is written.
+    let changes = replace::plan(repo_root, &config.pre_release_replacements, &next)?;
+    let commit = changes.iter().any(|c| c.changed());
+    let branch = git::current_branch(repo_root)?;
 
     let name = repo_root
         .file_name()
@@ -165,10 +210,8 @@ fn run_release(
     }
 
     if execute {
-        if !yes && !confirm(&format!("release {tag_name}?"))? {
-            warn("aborted");
-            return Ok(());
-        }
+        // Every precondition is checked before prompting, so answering "y"
+        // never leads straight into an avoidable error.
         if git::is_dirty(repo_root)? {
             bail!(
                 "'{}' has uncommitted changes; commit or stash them before releasing so the \
@@ -176,54 +219,66 @@ fn run_release(
                 repo_root.display()
             );
         }
-    }
-
-    // Dry run and execute walk the same steps and print the same lines; only
-    // execute mutates anything.
-    let replacements = &config.pre_release_replacements;
-    for r in replacements {
-        status("Updating", &r.file);
-        if execute {
-            replace::apply(repo_root, r, &next)?;
-        } else {
-            replace::check(repo_root, r)?;
+        if commit && config.push && branch.is_none() {
+            bail!(
+                "HEAD is detached, so the release commit would not be on any branch; check \
+                 out the branch to release from first"
+            );
         }
-    }
-
-    let commit = !replacements.is_empty();
-    let commit_message = template::render(&config.pre_release_commit_message, &next);
-    if commit {
-        status("Committing", &commit_message);
-        if execute {
-            let paths: Vec<String> = replacements.iter().map(|r| r.file.clone()).collect();
-            git::stage_and_commit(repo_root, &paths, &commit_message, config.sign_commit)?;
+        if config.push {
+            check_remote_tags_fetched(repo_root, config)?;
         }
-    }
-
-    if config.tag {
-        status("Tagging", &tag_name);
-        if execute {
-            git::create_tag(repo_root, &tag_name, &commit_message, config.sign_tag)?;
-        }
-    }
-
-    if config.push && (commit || config.tag) {
-        let mut refs = Vec::new();
-        if commit {
-            refs.push(git::current_branch(repo_root)?);
-        }
-        if config.tag {
-            refs.push(tag_name.clone());
-        }
-        status("Pushing", format!("{} to origin", refs.join(", ")));
-        if execute {
-            if commit {
-                git::push_current_branch(repo_root)?;
+        if !yes {
+            if !io::stdin().is_terminal() {
+                bail!(
+                    "refusing to release without confirmation: stdin is not a terminal; pass \
+                     --yes to release non-interactively"
+                );
             }
-            if config.tag {
-                git::push_tag(repo_root, &tag_name, false)?;
+            if !confirm(&format!("release {tag_name}?"))? {
+                bail!("aborted; nothing was changed");
             }
         }
+    } else if commit && config.push && branch.is_none() {
+        warn("HEAD is detached; --execute will refuse to commit and push from here");
+    }
+
+    let orig_head = git::head_sha(repo_root)?;
+    let mut tag_created = false;
+    let result = release_steps(
+        repo_root,
+        config,
+        &changes,
+        &next,
+        &tag_name,
+        branch.as_deref(),
+        execute,
+        &mut tag_created,
+    );
+
+    if let Err(err) = result {
+        if !execute {
+            return Err(err);
+        }
+        let mut rollback = Vec::new();
+        if tag_created {
+            if let Err(e) = git::delete_tag(repo_root, &tag_name) {
+                rollback.push(format!("deleting tag {tag_name}: {e:#}"));
+            }
+        }
+        if let Err(e) = git::reset_hard(repo_root, &orig_head) {
+            rollback.push(format!("resetting to {orig_head}: {e:#}"));
+        }
+        if rollback.is_empty() {
+            return Err(err.context(
+                "release failed; rolled back the local release commit, tag, and file \
+                 changes (nothing was pushed)",
+            ));
+        }
+        return Err(err.context(format!(
+            "release failed, and rolling it back also failed ({}); inspect the repo manually",
+            rollback.join("; ")
+        )));
     }
 
     if execute {
@@ -234,17 +289,101 @@ fn run_release(
     Ok(())
 }
 
+/// Dry run and execute walk the same steps and print the same lines; only
+/// execute mutates anything.
+#[allow(clippy::too_many_arguments)]
+fn release_steps(
+    repo_root: &Path,
+    config: &Config,
+    changes: &[replace::FileChange],
+    next: &Version,
+    tag_name: &str,
+    branch: Option<&str>,
+    execute: bool,
+    tag_created: &mut bool,
+) -> Result<()> {
+    for c in changes {
+        if c.changed() {
+            status("Updating", &c.file);
+        } else {
+            status("Skipping", format!("{} (already up to date)", c.file));
+        }
+    }
+    if execute {
+        replace::write(changes)?;
+    }
+
+    let changed: Vec<String> = changes
+        .iter()
+        .filter(|c| c.changed())
+        .map(|c| c.file.clone())
+        .collect();
+    let commit = !changed.is_empty();
+    let commit_message = template::render(&config.pre_release_commit_message, next);
+    if commit {
+        status("Committing", &commit_message);
+        if execute {
+            git::stage_and_commit(repo_root, &changed, &commit_message, config.sign_commit)?;
+        }
+    }
+
+    if config.tag {
+        status("Tagging", tag_name);
+        if execute {
+            git::create_tag(repo_root, tag_name, &commit_message, config.sign_tag)?;
+            *tag_created = true;
+        }
+    }
+
+    if config.push && (commit || config.tag) {
+        let mut names = Vec::new();
+        let mut refs = Vec::new();
+        if commit {
+            let branch = branch.unwrap_or("HEAD");
+            names.push(branch.to_string());
+            refs.push(format!("refs/heads/{branch}"));
+        }
+        if config.tag {
+            names.push(tag_name.to_string());
+            refs.push(format!("refs/tags/{tag_name}"));
+        }
+        status("Pushing", format!("{} to origin", names.join(", ")));
+        if execute {
+            git::push_refs(repo_root, &refs, false)?;
+        }
+    }
+    Ok(())
+}
+
 fn run_float(repo_root: &Path, config: &Config, tag: &str, execute: bool) -> Result<()> {
     if !git::tag_exists(repo_root, tag)? {
         bail!("tag '{tag}' does not exist locally; fetch it first");
     }
+    if !version::compile_pattern(&config.tag_pattern)?.is_match(tag) {
+        bail!(
+            "tag '{tag}' does not match tag-pattern '{}'; only release tags can be floated",
+            config.tag_pattern
+        );
+    }
 
-    let plan = float::plan(tag, &config.float_tags)?;
+    let known = version::matching_versions(&git::list_tags(repo_root)?, &config.tag_pattern)?;
+    let plan = float::plan(tag, &config.float_tags, &known)?;
+
+    for (floating, newer) in &plan.skipped {
+        status(
+            "Skipping",
+            format!("{floating} ({newer} is a newer stable release in its line)"),
+        );
+    }
 
     if plan.tags.is_empty() {
-        warn(
-            "no floating tags enabled in [float-tags] (major and minor both false); nothing to do",
-        );
+        if plan.skipped.is_empty() {
+            warn(
+                "no floating tags enabled in [float-tags] (major and minor both false); nothing to do",
+            );
+        } else {
+            warn("nothing to do");
+        }
         return Ok(());
     }
 
@@ -263,9 +402,8 @@ fn run_float(repo_root: &Path, config: &Config, tag: &str, execute: bool) -> Res
     if config.push {
         status("Pushing", format!("{} to origin", plan.tags.join(", ")));
         if execute {
-            for floating in &plan.tags {
-                git::push_tag(repo_root, floating, true)?;
-            }
+            let refs: Vec<String> = plan.tags.iter().map(|t| format!("refs/tags/{t}")).collect();
+            git::push_refs(repo_root, &refs, true)?;
         }
     }
 

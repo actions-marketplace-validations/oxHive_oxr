@@ -39,6 +39,48 @@ fn err(o: &Output) -> String {
     String::from_utf8_lossy(&o.stderr).to_string()
 }
 
+fn git_out(dir: &Path, args: &[&str]) -> String {
+    let o = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .output()
+        .unwrap();
+    assert!(o.status.success(), "`git {}` failed", args.join(" "));
+    String::from_utf8_lossy(&o.stdout).trim().to_string()
+}
+
+fn tags(dir: &Path) -> Vec<String> {
+    git_out(dir, &["tag", "-l"])
+        .lines()
+        .map(|s| s.to_string())
+        .collect()
+}
+
+/// Adds a fresh bare repo as `origin`. Deliberately does NOT set
+/// `push.autoSetupRemote` or an upstream: oxr must push explicitly.
+fn add_origin(dir: &Path) -> tempfile::TempDir {
+    let bare = tempfile::tempdir().unwrap();
+    git(bare.path(), &["init", "-q", "--bare"]);
+    git(
+        dir,
+        &["remote", "add", "origin", bare.path().to_str().unwrap()],
+    );
+    bare
+}
+
+fn commit_all(dir: &Path, message: &str) {
+    git(dir, &["add", "-A"]);
+    git(dir, &["commit", "-q", "-m", message]);
+}
+
+const PLUGIN_REPLACEMENT: &str = r#"
+[[pre-release-replacements]]
+file = "plugin.json"
+search = "\"version\": \"[^\"]+\""
+replace = "\"version\": \"{{version}}\""
+exactly = 1
+"#;
+
 #[test]
 fn init_writes_oxr_toml_and_respects_force() {
     let dir = init_repo();
@@ -323,26 +365,35 @@ fn release_execute_refuses_a_dirty_working_tree_but_dry_run_still_previews() {
 }
 
 #[test]
-fn release_execute_without_yes_aborts_on_unconfirmed_prompt() {
-    // `run` uses Output::output(), which closes stdin, so the confirmation
-    // prompt reads EOF and treats it as "no" without hanging the test.
+fn release_execute_without_yes_fails_when_stdin_is_not_a_terminal() {
+    // Regression: with no terminal the prompt read EOF, printed "aborted",
+    // and exited 0, so a CI job missing --yes went green having released
+    // nothing. `run` uses Output::output(), so stdin is not a terminal.
     let dir = init_repo();
+    std::fs::write(dir.path().join("oxr.toml"), "push = false\n").unwrap();
+    commit_all(dir.path(), "cfg");
 
     let o = run(dir.path(), &["release", "patch", "--execute"]);
-    assert!(o.status.success(), "{}", err(&o));
-    assert!(err(&o).contains("[y/N]"), "{}", err(&o));
-    assert!(err(&o).contains("aborted"), "{}", err(&o));
+    assert!(!o.status.success(), "{}", out(&o));
+    assert!(err(&o).contains("pass --yes"), "{}", err(&o));
+    assert!(tags(dir.path()).is_empty());
+}
 
-    let tags = String::from_utf8(
-        Command::new("git")
-            .args(["tag", "-l"])
-            .current_dir(dir.path())
-            .output()
-            .unwrap()
-            .stdout,
-    )
-    .unwrap();
-    assert!(tags.is_empty(), "{tags}");
+#[test]
+fn release_preconditions_are_checked_before_the_prompt() {
+    // A dirty tree or a broken replacement must surface before asking for
+    // confirmation, not after the user has already said yes.
+    let dir = init_repo();
+    std::fs::write(dir.path().join("untracked"), "x").unwrap();
+    let o = run(dir.path(), &["release", "patch", "--execute"]);
+    assert!(err(&o).contains("uncommitted changes"), "{}", err(&o));
+
+    let dir = init_repo();
+    std::fs::write(dir.path().join("oxr.toml"), PLUGIN_REPLACEMENT).unwrap();
+    std::fs::write(dir.path().join("plugin.json"), "{}").unwrap();
+    commit_all(dir.path(), "cfg");
+    let o = run(dir.path(), &["release", "patch", "--execute"]);
+    assert!(err(&o).contains("found 0"), "{}", err(&o));
 }
 
 #[test]
@@ -401,23 +452,188 @@ exactly = 1
 }
 
 #[test]
-fn release_refuses_a_tag_that_already_exists() {
-    // A tag oxr computes can only collide with one already in the repo if
-    // that existing tag is invisible to version resolution (a custom
-    // tag-pattern that doesn't match it) yet still occupies the tag-name
-    // oxr's default template would render for a fresh bootstrap release.
+fn release_refuses_a_tag_name_that_tag_pattern_cannot_see() {
+    // Regression: with tag-name and tag-pattern out of sync, new tags were
+    // invisible to resolution; the first release worked and the second
+    // recomputed the same version and failed with "already exists".
     let dir = init_repo();
-    std::fs::write(dir.path().join("oxr.toml"), "tag-pattern = \"^release-\"\n").unwrap();
-    git(dir.path(), &["add", "oxr.toml"]);
-    git(dir.path(), &["commit", "-q", "-m", "add config"]);
-    git(dir.path(), &["tag", "v0.1.0"]);
+    std::fs::write(
+        dir.path().join("oxr.toml"),
+        "push = false\ntag-name = \"release-{{version}}\"\n",
+    )
+    .unwrap();
+    commit_all(dir.path(), "cfg");
 
-    let o = run(dir.path(), &["current"]);
-    assert!(out(&o).contains("latest_stable: none"), "{}", out(&o));
+    let o = run(dir.path(), &["release", "minor"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("would not resolve back"), "{}", err(&o));
+    assert!(tags(dir.path()).is_empty());
+}
+
+#[test]
+fn unknown_config_keys_are_rejected() {
+    let dir = init_repo();
+    std::fs::write(dir.path().join("oxr.toml"), "pushh = false\n").unwrap();
+    let o = run(dir.path(), &["release", "patch"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("unknown field"), "{}", err(&o));
+}
+
+#[test]
+fn release_pushes_without_an_upstream_configured() {
+    // Regression: the branch push was a bare `git push`, which fails with
+    // no upstream after the commit and tag already existed locally.
+    let dir = init_repo();
+    let bare = add_origin(dir.path());
+    std::fs::write(dir.path().join("oxr.toml"), PLUGIN_REPLACEMENT).unwrap();
+    std::fs::write(dir.path().join("plugin.json"), r#"{"version": "0.0.0"}"#).unwrap();
+    commit_all(dir.path(), "cfg");
+
+    let o = run(dir.path(), &["release", "minor", "--execute", "--yes"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(tags(bare.path()), vec!["v0.1.0".to_string()]);
+    assert_eq!(
+        git_out(bare.path(), &["log", "-1", "--pretty=%s"]),
+        "chore: release v0.1.0"
+    );
+}
+
+#[test]
+fn failed_push_rolls_back_so_a_retry_releases_the_same_version() {
+    // Regression: a rejected push left the commit and tag local, and the
+    // retry saw that tag and bumped again (v0.1.0, then v0.2.0, ...).
+    let dir = init_repo();
+    let bare = add_origin(dir.path());
+    std::fs::write(dir.path().join("oxr.toml"), PLUGIN_REPLACEMENT).unwrap();
+    std::fs::write(dir.path().join("plugin.json"), r#"{"version": "0.0.0"}"#).unwrap();
+    commit_all(dir.path(), "cfg");
+    let branch = git_out(dir.path(), &["rev-parse", "--abbrev-ref", "HEAD"]);
+    let head_before = git_out(dir.path(), &["rev-parse", "HEAD"]);
+
+    // Make origin's branch diverge so the push is rejected as non-fast-forward.
+    let other = tempfile::tempdir().unwrap();
+    git(
+        other.path(),
+        &["clone", "-q", bare.path().to_str().unwrap(), "."],
+    );
+    git(other.path(), &["config", "user.email", "t@example.com"]);
+    git(other.path(), &["config", "user.name", "t"]);
+    git(other.path(), &["checkout", "-q", "-b", &branch]);
+    git(
+        other.path(),
+        &["commit", "-q", "--allow-empty", "-m", "elsewhere"],
+    );
+    git(other.path(), &["push", "-q", "origin", &branch]);
+
+    for _ in 0..2 {
+        let o = run(dir.path(), &["release", "minor", "--execute", "--yes"]);
+        assert!(!o.status.success());
+        assert!(err(&o).contains(" to 0.1.0"), "{}", err(&o));
+        assert!(!err(&o).contains("0.2.0"), "{}", err(&o));
+        assert!(err(&o).contains("rolled back"), "{}", err(&o));
+
+        assert!(tags(dir.path()).is_empty());
+        assert_eq!(git_out(dir.path(), &["rev-parse", "HEAD"]), head_before);
+        assert_eq!(git_out(dir.path(), &["status", "--porcelain"]), "");
+        assert!(
+            tags(bare.path()).is_empty(),
+            "atomic push must not land the tag"
+        );
+    }
+}
+
+#[test]
+fn release_refuses_when_origin_has_unfetched_tags() {
+    let dir = init_repo();
+    let bare = add_origin(dir.path());
+    git(dir.path(), &["tag", "v0.5.0"]);
+    git(dir.path(), &["push", "-q", "origin", "refs/tags/v0.5.0"]);
+    git(dir.path(), &["tag", "-d", "v0.5.0"]);
+    assert_eq!(tags(bare.path()), vec!["v0.5.0".to_string()]);
 
     let o = run(dir.path(), &["release", "patch", "--execute", "--yes"]);
     assert!(!o.status.success());
-    assert!(err(&o).contains("already exists"), "{}", err(&o));
+    assert!(err(&o).contains("git fetch --tags"), "{}", err(&o));
+    assert!(err(&o).contains("v0.5.0"), "{}", err(&o));
+    assert!(tags(dir.path()).is_empty());
+}
+
+#[test]
+fn release_with_a_no_op_replacement_tags_without_committing() {
+    // Regression: a replacement that rendered identical text (a
+    // `{{major}}`-only reference on a patch release) was still committed,
+    // and `git commit` failed with nothing to commit.
+    let dir = init_repo();
+    std::fs::write(
+        dir.path().join("oxr.toml"),
+        r#"push = false
+[[pre-release-replacements]]
+file = "README.md"
+search = 'oxhive/oxr@v\d+'
+replace = 'oxhive/oxr@v{{major}}'
+exactly = 1
+"#,
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("README.md"), "uses: oxhive/oxr@v1\n").unwrap();
+    commit_all(dir.path(), "cfg");
+    git(dir.path(), &["tag", "v1.0.0"]);
+    let head_before = git_out(dir.path(), &["rev-parse", "HEAD"]);
+
+    let o = run(dir.path(), &["release", "patch"]);
+    assert!(
+        err(&o).contains("Skipping README.md (already up to date)"),
+        "{}",
+        err(&o)
+    );
+
+    let o = run(dir.path(), &["release", "patch", "--execute", "--yes"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(!err(&o).contains("Committing"), "{}", err(&o));
+    assert_eq!(git_out(dir.path(), &["rev-parse", "HEAD"]), head_before);
+    assert!(tags(dir.path()).contains(&"v1.0.1".to_string()));
+}
+
+#[test]
+fn release_with_a_bad_second_replacement_leaves_the_tree_clean() {
+    // Regression: the first file was rewritten before the second entry
+    // was validated, leaving a dirty tree behind.
+    let dir = init_repo();
+    std::fs::write(
+        dir.path().join("oxr.toml"),
+        format!(
+            "push = false\n{}{}",
+            PLUGIN_REPLACEMENT,
+            PLUGIN_REPLACEMENT.replace("plugin.json", "other.json")
+        ),
+    )
+    .unwrap();
+    std::fs::write(dir.path().join("plugin.json"), r#"{"version": "0.0.0"}"#).unwrap();
+    std::fs::write(dir.path().join("other.json"), "{}").unwrap();
+    commit_all(dir.path(), "cfg");
+
+    let o = run(dir.path(), &["release", "patch", "--execute", "--yes"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("other.json"), "{}", err(&o));
+    assert_eq!(git_out(dir.path(), &["status", "--porcelain"]), "");
+}
+
+#[test]
+fn release_refuses_to_commit_on_a_detached_head() {
+    let dir = init_repo();
+    let _bare = add_origin(dir.path());
+    std::fs::write(dir.path().join("oxr.toml"), PLUGIN_REPLACEMENT).unwrap();
+    std::fs::write(dir.path().join("plugin.json"), r#"{"version": "0.0.0"}"#).unwrap();
+    commit_all(dir.path(), "cfg");
+    git(dir.path(), &["checkout", "-q", "--detach"]);
+    let head_before = git_out(dir.path(), &["rev-parse", "HEAD"]);
+
+    let o = run(dir.path(), &["release", "patch", "--execute", "--yes"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("HEAD is detached"), "{}", err(&o));
+    assert_eq!(git_out(dir.path(), &["rev-parse", "HEAD"]), head_before);
+    assert_eq!(git_out(dir.path(), &["status", "--porcelain"]), "");
+    assert!(tags(dir.path()).is_empty());
 }
 
 #[test]
@@ -473,4 +689,70 @@ fn float_dry_run_does_not_move_the_tag() {
         .unwrap()
         .success();
     assert!(!exists, "dry run must not create the floating tag");
+}
+
+#[test]
+fn float_skips_a_major_tag_that_a_newer_minor_already_owns() {
+    // Regression: floating a hotfix for an older minor (v1.2.1 after
+    // v1.3.0) moved `v1` backwards.
+    let dir = init_repo();
+    std::fs::write(
+        dir.path().join("oxr.toml"),
+        "push = false\n[float-tags]\nminor = true\n",
+    )
+    .unwrap();
+    commit_all(dir.path(), "cfg");
+    git(dir.path(), &["tag", "v1.3.0"]);
+    let o = run(dir.path(), &["float", "--tag", "v1.3.0", "--execute"]);
+    assert!(o.status.success(), "{}", err(&o));
+    let v1_before = git_out(dir.path(), &["rev-parse", "v1^{commit}"]);
+
+    git(
+        dir.path(),
+        &["commit", "-q", "--allow-empty", "-m", "hotfix"],
+    );
+    git(dir.path(), &["tag", "v1.2.1"]);
+    let o = run(dir.path(), &["float", "--tag", "v1.2.1", "--execute"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(
+        err(&o).contains("Skipping v1 (1.3.0 is a newer"),
+        "{}",
+        err(&o)
+    );
+    assert_eq!(
+        git_out(dir.path(), &["rev-parse", "v1^{commit}"]),
+        v1_before
+    );
+    assert_eq!(
+        git_out(dir.path(), &["rev-parse", "v1.2^{commit}"]),
+        git_out(dir.path(), &["rev-parse", "v1.2.1^{commit}"])
+    );
+}
+
+#[test]
+fn float_pushes_when_a_branch_shares_the_floating_tag_name() {
+    // Regression: `git push origin --force v1` failed with "src refspec v1
+    // matches more than one" when a `v1` branch also existed.
+    let dir = init_repo();
+    let bare = add_origin(dir.path());
+    git(dir.path(), &["tag", "v1.0.0"]);
+    git(dir.path(), &["branch", "v1"]);
+    git(dir.path(), &["push", "-q", "origin", "refs/heads/v1"]);
+
+    let o = run(dir.path(), &["float", "--tag", "v1.0.0", "--execute"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert_eq!(tags(bare.path()), vec!["v1".to_string()]);
+}
+
+#[test]
+fn float_refuses_a_tag_outside_tag_pattern() {
+    let dir = init_repo();
+    git(dir.path(), &["tag", "build-1.0.0"]);
+    let o = run(dir.path(), &["float", "--tag", "build-1.0.0"]);
+    assert!(!o.status.success());
+    assert!(
+        err(&o).contains("does not match tag-pattern"),
+        "{}",
+        err(&o)
+    );
 }

@@ -4,7 +4,9 @@ use std::process::Command;
 use anyhow::{bail, Context, Result};
 
 /// Runs `git <args>` in the given working directory and returns trimmed
-/// stdout, or an error carrying git's stderr on non-zero exit.
+/// stdout, or an error carrying git's output on non-zero exit. Some git
+/// failures (e.g. `commit` with nothing to commit) only explain themselves
+/// on stdout, so both streams are included.
 fn run(cwd: &Path, args: &[&str]) -> Result<String> {
     let output = Command::new("git")
         .args(args)
@@ -13,11 +15,19 @@ fn run(cwd: &Path, args: &[&str]) -> Result<String> {
         .with_context(|| format!("failed to execute `git {}`", args.join(" ")))?;
 
     if !output.status.success() {
-        bail!(
-            "`git {}` failed: {}",
-            args.join(" "),
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = [stderr.trim(), stdout.trim()]
+            .into_iter()
+            .filter(|s| !s.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n");
+        let detail = if detail.is_empty() {
+            format!("exited with {}", output.status)
+        } else {
+            detail
+        };
+        bail!("`git {}` failed: {detail}", args.join(" "));
     }
 
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
@@ -67,17 +77,55 @@ pub fn list_tags(repo_root: &Path) -> Result<Vec<String>> {
         .collect())
 }
 
-pub fn current_branch(repo_root: &Path) -> Result<String> {
-    run(repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])
-}
-
 pub fn tag_exists(repo_root: &Path, name: &str) -> Result<bool> {
     Ok(list_tags(repo_root)?.iter().any(|t| t == name))
 }
 
-/// Resolves a tag (or any committish) to the commit sha it points at.
-pub fn commit_of(repo_root: &Path, committish: &str) -> Result<String> {
-    run(repo_root, &["rev-list", "-n", "1", committish])
+/// Resolves a tag to the commit sha it points at. Always addresses
+/// `refs/tags/<name>` so a same-named branch can't be picked instead.
+pub fn commit_of(repo_root: &Path, tag: &str) -> Result<String> {
+    run(
+        repo_root,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("refs/tags/{tag}^{{commit}}"),
+        ],
+    )
+}
+
+pub fn head_sha(repo_root: &Path) -> Result<String> {
+    run(repo_root, &["rev-parse", "--verify", "HEAD"])
+}
+
+/// The checked-out branch name, or `None` on a detached HEAD.
+pub fn current_branch(repo_root: &Path) -> Result<Option<String>> {
+    let out = run(repo_root, &["rev-parse", "--abbrev-ref", "HEAD"])?;
+    Ok((out != "HEAD").then_some(out))
+}
+
+/// Tag names on `remote`, without contacting anything but that remote.
+pub fn remote_tags(repo_root: &Path, remote: &str) -> Result<Vec<String>> {
+    let out = run(repo_root, &["ls-remote", "--tags", "--refs", remote])?;
+    Ok(out
+        .lines()
+        .filter_map(|line| line.split('\t').nth(1))
+        .filter_map(|r| r.strip_prefix("refs/tags/"))
+        .map(|s| s.to_string())
+        .collect())
+}
+
+pub fn delete_tag(repo_root: &Path, name: &str) -> Result<()> {
+    run(repo_root, &["tag", "-d", name])?;
+    Ok(())
+}
+
+/// Resets HEAD, index, and working tree to `sha`. Only used to undo oxr's
+/// own release commit/file rewrites, after `is_dirty` confirmed there was
+/// nothing else in the tree to lose.
+pub fn reset_hard(repo_root: &Path, sha: &str) -> Result<()> {
+    run(repo_root, &["reset", "-q", "--hard", sha])?;
+    Ok(())
 }
 
 pub fn create_tag(repo_root: &Path, name: &str, message: &str, sign: bool) -> Result<()> {
@@ -109,17 +157,17 @@ pub fn force_move_tag(
     Ok(())
 }
 
-pub fn push_tag(repo_root: &Path, name: &str, force: bool) -> Result<()> {
-    let mut args = vec!["push", "origin"];
+/// Pushes `refs` (full ref names, e.g. `refs/tags/v1`) to origin in a
+/// single `--atomic` push: either every ref updates or none does, so a
+/// release commit can never land on the remote without its tag.
+pub fn push_refs(repo_root: &Path, refs: &[String], force: bool) -> Result<()> {
+    let mut args = vec!["push", "--atomic"];
     if force {
         args.push("--force");
     }
-    args.push(name);
+    args.push("origin");
+    args.extend(refs.iter().map(|s| s.as_str()));
     run_streaming(repo_root, &args)
-}
-
-pub fn push_current_branch(repo_root: &Path) -> Result<()> {
-    run_streaming(repo_root, &["push"])
 }
 
 pub fn stage_and_commit(
@@ -268,23 +316,60 @@ mod tests {
     }
 
     #[test]
-    fn push_tag_and_push_current_branch_reach_the_remote() {
+    fn push_refs_reaches_the_remote_atomically() {
         let bare = tempfile::tempdir().unwrap();
         git(bare.path(), &["init", "-q", "--bare"]);
 
         let dir = init_repo();
-        git(dir.path(), &["config", "push.autoSetupRemote", "true"]);
         git(
             dir.path(),
             &["remote", "add", "origin", bare.path().to_str().unwrap()],
         );
-
-        push_current_branch(dir.path()).unwrap();
+        let branch = current_branch(dir.path()).unwrap().unwrap();
 
         create_tag(dir.path(), "v1.0.0", "release v1.0.0", false).unwrap();
-        push_tag(dir.path(), "v1.0.0", false).unwrap();
+        push_refs(
+            dir.path(),
+            &[
+                format!("refs/heads/{branch}"),
+                "refs/tags/v1.0.0".to_string(),
+            ],
+            false,
+        )
+        .unwrap();
 
         let remote_tags = run(bare.path(), &["tag", "-l"]).unwrap();
         assert_eq!(remote_tags, "v1.0.0");
+        assert_eq!(
+            super::remote_tags(dir.path(), "origin").unwrap(),
+            vec!["v1.0.0".to_string()]
+        );
+    }
+
+    #[test]
+    fn run_error_includes_stdout_when_stderr_is_empty() {
+        // Regression: `git commit` with nothing staged explains itself only
+        // on stdout, which used to produce an empty error message.
+        let dir = init_repo();
+        let err = run(dir.path(), &["commit", "-m", "nothing"]).unwrap_err();
+        assert!(err.to_string().contains("nothing to commit"), "{err}");
+    }
+
+    #[test]
+    fn commit_of_prefers_the_tag_over_a_same_named_branch() {
+        let dir = init_repo();
+        let first = run(dir.path(), &["rev-parse", "HEAD"]).unwrap();
+        create_tag(dir.path(), "v1", "float", false).unwrap();
+        git(dir.path(), &["commit", "-q", "--allow-empty", "-m", "c2"]);
+        git(dir.path(), &["branch", "v1"]);
+        assert_eq!(commit_of(dir.path(), "v1").unwrap(), first);
+    }
+
+    #[test]
+    fn current_branch_is_none_when_detached() {
+        let dir = init_repo();
+        assert!(current_branch(dir.path()).unwrap().is_some());
+        git(dir.path(), &["checkout", "-q", "--detach"]);
+        assert!(current_branch(dir.path()).unwrap().is_none());
     }
 }
