@@ -110,6 +110,59 @@ fn init_notes_a_coexisting_release_toml() {
 }
 
 #[test]
+fn config_flag_versions_monorepo_apps_independently() {
+    let dir = init_repo();
+    std::fs::create_dir_all(dir.path().join("apps/shop")).unwrap();
+
+    let o = run(dir.path(), &["--config", "apps/shop/oxr.toml", "init"]);
+    assert!(o.status.success(), "{}", err(&o));
+    assert!(dir.path().join("apps/shop/oxr.toml").exists());
+    assert!(!dir.path().join("oxr.toml").exists());
+
+    for app in ["shop", "seller"] {
+        std::fs::create_dir_all(dir.path().join("apps").join(app)).unwrap();
+        std::fs::write(
+            dir.path().join("apps").join(app).join("oxr.toml"),
+            format!(
+                "push = false\ntag-name = \"{app}-v{{{{version}}}}\"\n\
+                 tag-pattern = \"^{app}-v\\\\d+\\\\.\\\\d+\\\\.\\\\d+\"\n"
+            ),
+        )
+        .unwrap();
+    }
+    commit_all(dir.path(), "configs");
+    git(dir.path(), &["tag", "shop-v1.4.0"]);
+    git(dir.path(), &["tag", "seller-v0.2.0"]);
+
+    let shop = ["--config", "apps/shop/oxr.toml"];
+    let o = run(
+        dir.path(),
+        &[&shop[..], &["release", "minor", "--execute", "--yes"]].concat(),
+    );
+    assert!(o.status.success(), "{}", err(&o));
+    let o = run(
+        dir.path(),
+        &[
+            "release",
+            "patch",
+            "--execute",
+            "--yes",
+            "--config",
+            "apps/seller/oxr.toml",
+        ],
+    );
+    assert!(o.status.success(), "{}", err(&o));
+
+    let t = tags(dir.path());
+    assert!(t.contains(&"shop-v1.5.0".to_string()), "{t:?}");
+    assert!(t.contains(&"seller-v0.2.1".to_string()), "{t:?}");
+
+    let o = run(dir.path(), &["--config", "apps/nope/oxr.toml", "current"]);
+    assert!(!o.status.success());
+    assert!(err(&o).contains("apps/nope/oxr.toml"), "{}", err(&o));
+}
+
+#[test]
 fn current_reports_none_on_an_empty_repo_text_and_json() {
     let dir = init_repo();
 

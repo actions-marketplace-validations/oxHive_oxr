@@ -77,7 +77,7 @@ cargo install --path .
 ## CLI
 
 ```
-oxr init [--force]
+oxr [--config <path>] init [--force]
 oxr release <level> [--for <major|minor>] [--execute] [--yes]
 oxr float --tag <tag> [--execute]
 oxr current [--json]
@@ -256,6 +256,23 @@ Beyond floating-tag maintenance, `oxr` in a pipeline typically covers:
 Read from `oxr.toml` at the repo root by default, falling back to
 `release.toml` for anyone coming from cargo-release out of habit. Neither
 file existing is fine; oxr runs on defaults.
+
+`--config <path>` (any subcommand, relative to the current directory) uses
+that file instead and errors if it's missing. For a monorepo, give each app
+its own config with a prefixed `tag-name`/`tag-pattern` so their versions
+resolve independently; `pre-release-replacements` paths stay relative to
+the repo root:
+
+```toml
+# apps/shop-web/oxr.toml
+tag-name = "shop-web-v{{version}}"
+tag-pattern = "^shop-web-v\\d+\\.\\d+\\.\\d+"
+pre-release-commit-message = "chore: release shop-web v{{version}}"
+```
+
+```sh
+oxr --config apps/shop-web/oxr.toml release minor --execute
+```
 
 **oxr's config is [cargo-release](https://github.com/crate-ci/cargo-release)-inspired,
 not compatible with it.** It reuses several field names (`sign-commit`,

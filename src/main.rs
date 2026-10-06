@@ -51,7 +51,7 @@ fn run() -> Result<()> {
     // `init` only writes a scaffold file; it needs neither tag history nor
     // an existing config, so it's exempt from the shallow-checkout gate.
     match cli.command {
-        cli::Command::Init { force } => return run_init(&repo_root, force),
+        cli::Command::Init { force } => return run_init(&repo_root, cli.config.as_deref(), force),
         cli::Command::Current { .. }
         | cli::Command::Release { .. }
         | cli::Command::Float { .. } => {}
@@ -67,7 +67,10 @@ fn run() -> Result<()> {
         );
     }
 
-    let config = config::load(&repo_root)?;
+    let config = match &cli.config {
+        Some(path) => config::load_file(path)?,
+        None => config::load(&repo_root)?,
+    };
 
     match cli.command {
         cli::Command::Init { .. } => unreachable!("handled above"),
@@ -82,9 +85,8 @@ fn run() -> Result<()> {
     }
 }
 
-fn run_init(repo_root: &Path, force: bool) -> Result<()> {
-    let target = repo_root.join("oxr.toml");
-    let legacy = repo_root.join("release.toml");
+fn run_init(repo_root: &Path, config_path: Option<&Path>, force: bool) -> Result<()> {
+    let target = config_path.map_or_else(|| repo_root.join("oxr.toml"), Path::to_path_buf);
 
     if target.exists() && !force {
         bail!(
@@ -97,7 +99,8 @@ fn run_init(repo_root: &Path, force: bool) -> Result<()> {
         .with_context(|| format!("writing {}", target.display()))?;
 
     status("Created", target.display());
-    if legacy.exists() {
+    let legacy = repo_root.join("release.toml");
+    if config_path.is_none() && legacy.exists() {
         warn(format!(
             "'{}' also exists; oxr.toml now takes precedence over it",
             legacy.display()

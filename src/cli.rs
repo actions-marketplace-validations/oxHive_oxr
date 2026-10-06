@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use clap::{Parser, Subcommand};
 
 use crate::release::{ForTarget, Level};
@@ -9,6 +11,10 @@ use crate::release::{ForTarget, Level};
     about = "Semantic-version bump and git-tag orchestrator for manifest-less repos"
 )]
 pub struct Cli {
+    /// Config file to use instead of oxr.toml/release.toml at the repo root,
+    /// e.g. one per app in a monorepo. Must exist (except for `init`).
+    #[arg(long, global = true)]
+    pub config: Option<PathBuf>,
     #[command(subcommand)]
     pub command: Command,
 }

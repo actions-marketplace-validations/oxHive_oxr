@@ -113,14 +113,18 @@ pub fn load(repo_root: &Path) -> Result<Config> {
     for name in ["oxr.toml", "release.toml"] {
         let path = repo_root.join(name);
         if path.exists() {
-            let text = std::fs::read_to_string(&path)
-                .with_context(|| format!("reading {}", path.display()))?;
-            let config: Config =
-                toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-            return Ok(config);
+            return load_file(&path);
         }
     }
     Ok(Config::default())
+}
+
+/// Loads an explicit `--config` path. Unlike `load`, a missing file is an
+/// error: a typo'd path must not silently release with default settings.
+pub fn load_file(path: &Path) -> Result<Config> {
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
 /// Scaffold written by `oxr init`. Fully commented on purpose: oxr behaves
